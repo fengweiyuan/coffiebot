@@ -1,0 +1,35 @@
+x-common-config: &common-config
+  build:
+    context: .
+    dockerfile: Dockerfile
+  volumes:
+    # 持久化配置、数据和日志
+    # 容器内 ~/.coffiebot (/root/.coffiebot) → 宿主机 ./data
+    # 其中日志输出在 ~/.coffiebot/logs/ → 宿主机 ./data/logs/
+    - ./data:/root/.coffiebot
+
+services:
+  coffiebot-gateway:
+    container_name: coffiebot-gateway
+    <<: *common-config
+    network_mode: host
+    command: ["gateway"]
+    restart: unless-stopped
+    environment:
+      - TZ=Asia/Shanghai
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+  
+  coffiebot-cli:
+    <<: *common-config
+    profiles:
+      - cli
+    command: ["status"]
+    stdin_open: true
+    tty: true
