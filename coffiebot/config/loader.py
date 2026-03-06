@@ -8,7 +8,8 @@ from coffiebot.config.schema import Config
 
 def get_config_path() -> Path:
     """Get the default configuration file path."""
-    return Path.home() / ".coffiebot" / "config.json"
+    from coffiebot.utils.helpers import get_data_path
+    return get_data_path() / "config.json"
 
 
 def get_data_dir() -> Path:

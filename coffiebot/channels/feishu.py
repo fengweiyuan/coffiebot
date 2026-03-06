@@ -727,7 +727,8 @@ class FeishuChannel(BaseChannel):
                 )
             else:
                 # 图片等类型直接保存，不走缓存
-                media_dir = Path.home() / ".coffiebot" / "media"
+                from coffiebot.utils.helpers import get_data_path
+                media_dir = get_data_path() / "media"
                 media_dir.mkdir(parents=True, exist_ok=True)
                 file_path = media_dir / filename
                 file_path.write_bytes(data)

@@ -41,7 +41,8 @@ class MediaCache:
         Returns:
             None
         """
-        self.cache_dir = cache_dir or Path.home() / ".coffiebot" / "media"
+        from coffiebot.utils.helpers import get_data_path
+        self.cache_dir = cache_dir or get_data_path() / "media"
         self.index_path = self.cache_dir / ".index.json"
         self.ttl_days = ttl_days
 

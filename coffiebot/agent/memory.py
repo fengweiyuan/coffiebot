@@ -1,36 +1,51 @@
-"""Memory system — OpenViking 语义记忆为唯一数据源。"""
+"""Memory system — 语义记忆存储（支持 OpenViking / Mem0 后端）。"""
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from loguru import logger
 
 from coffiebot.utils.helpers import ensure_dir
 
 if TYPE_CHECKING:
-    from coffiebot.openviking.memory_bridge import MemoryBridge
     from coffiebot.session.manager import Session
 
 
+@runtime_checkable
+class MemoryBridgeProtocol(Protocol):
+    """记忆桥接协议，所有记忆后端（OpenViking / Mem0）必须实现此接口。"""
+
+    @property
+    def is_available(self) -> bool: ...
+    async def check_available(self) -> bool: ...
+    async def recall(self, query: str, limit: int | None = None) -> str: ...
+    async def capture(self, session_key: str, messages: list[dict[str, Any]]) -> bool: ...
+    async def close(self) -> None: ...
+
+
 class MemoryStore:
-    """OpenViking 语义记忆存储，recall（检索）和 capture（存储）均走 OV。"""
+    """语义记忆存储，recall（检索）和 capture（存储）通过可插拔的 bridge 后端执行。"""
 
     def __init__(self, workspace: Path):
         self.memory_dir = ensure_dir(workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "HISTORY.md"
-        self._ov_bridge: MemoryBridge | None = None
+        self._bridge: MemoryBridgeProtocol | None = None
 
-    def set_openviking_bridge(self, bridge: MemoryBridge | None) -> None:
+    def set_bridge(self, bridge: MemoryBridgeProtocol | None) -> None:
         """
-        设置 OpenViking 记忆桥接实例。
+        设置记忆桥接实例。
 
         Params:
-            bridge (MemoryBridge | None): 桥接实例，None 表示禁用
+            bridge (MemoryBridgeProtocol | None): 桥接实例，None 表示禁用
         """
-        self._ov_bridge = bridge
+        self._bridge = bridge
+
+    def set_openviking_bridge(self, bridge: Any) -> None:
+        """兼容别名，等价于 set_bridge()。"""
+        self.set_bridge(bridge)
 
     def read_long_term(self) -> str:
         if self.memory_file.exists():
@@ -51,29 +66,27 @@ class MemoryStore:
 
     async def get_memory_context_async(self, query: str = "") -> str:
         """
-        异步版本：仅走 OV 语义检索，OV 不可用时返回空。
-
-        不再降级到本地 MEMORY.md，保证单一数据源（OpenViking）。
+        异步版本：通过 bridge 语义检索，bridge 不可用时返回空。
 
         Params:
             query (str): 当前用户消息，作为语义检索的查询词
 
         Returns:
-            str: 格式化的记忆上下文文本，OV 不可用或无结果时返回空字符串
+            str: 格式化的记忆上下文文本，bridge 不可用或无结果时返回空字符串
         """
-        if self._ov_bridge and self._ov_bridge.is_available and query:
-            ov_result = await self._ov_bridge.recall(query)
-            if ov_result:
-                logger.debug("Memory recall via OpenViking: {} chars", len(ov_result))
-                return ov_result
-            logger.debug("OpenViking recall returned empty for query: {}", query[:80])
+        if self._bridge and self._bridge.is_available and query:
+            result = await self._bridge.recall(query)
+            if result:
+                logger.debug("Memory recall: {} chars", len(result))
+                return result
+            logger.debug("Memory recall returned empty for query: {}", query[:80])
             return ""
 
-        if not self._ov_bridge or not self._ov_bridge.is_available:
-            logger.debug("OpenViking not available, no memory context")
+        if not self._bridge or not self._bridge.is_available:
+            logger.debug("Memory bridge not available, no memory context")
         return ""
 
-    async def capture_to_openviking(
+    async def capture(
         self,
         session: Session,
         *,
@@ -81,9 +94,7 @@ class MemoryStore:
         memory_window: int = 50,
     ) -> bool:
         """
-        将会话消息提交到 OpenViking 进行记忆提取。
-
-        不再写 MEMORY.md/HISTORY.md，仅走 OV capture。
+        将会话消息提交到记忆后端进行记忆提取。
 
         Params:
             session (Session): 待提交的会话
@@ -91,16 +102,16 @@ class MemoryStore:
             memory_window (int): 记忆窗口大小，用于计算待提交范围
 
         Returns:
-            bool: 提交成功返回 True，OV 不可用或失败返回 False
+            bool: 提交成功返回 True，bridge 不可用或失败返回 False
         """
-        if not self._ov_bridge or not self._ov_bridge.is_available:
-            logger.debug("OpenViking not available, skipping capture")
+        if not self._bridge or not self._bridge.is_available:
+            logger.debug("Memory bridge not available, skipping capture")
             return False
 
         if archive_all:
             messages_to_capture = session.messages
             keep_count = 0
-            logger.info("OV capture (archive_all): {} messages", len(session.messages))
+            logger.info("Memory capture (archive_all): {} messages", len(session.messages))
         else:
             keep_count = memory_window // 2
             if len(session.messages) <= keep_count:
@@ -110,10 +121,20 @@ class MemoryStore:
             messages_to_capture = session.messages[session.last_consolidated:-keep_count]
             if not messages_to_capture:
                 return True
-            logger.info("OV capture: {} messages to capture, {} keep", len(messages_to_capture), keep_count)
+            logger.info("Memory capture: {} messages to capture, {} keep", len(messages_to_capture), keep_count)
 
-        success = await self._ov_bridge.capture(session.key, messages_to_capture)
+        success = await self._bridge.capture(session.key, messages_to_capture)
         if success:
             session.last_consolidated = 0 if archive_all else len(session.messages) - keep_count
-            logger.info("OV capture done: last_consolidated={}", session.last_consolidated)
+            logger.info("Memory capture done: last_consolidated={}", session.last_consolidated)
         return success
+
+    async def capture_to_openviking(
+        self,
+        session: Session,
+        *,
+        archive_all: bool = False,
+        memory_window: int = 50,
+    ) -> bool:
+        """兼容别名，等价于 capture()。"""
+        return await self.capture(session, archive_all=archive_all, memory_window=memory_window)

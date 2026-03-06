@@ -1,5 +1,6 @@
 """Utility functions for coffiebot."""
 
+import os
 import re
 from pathlib import Path
 from datetime import datetime
@@ -12,13 +13,20 @@ def ensure_dir(path: Path) -> Path:
 
 
 def get_data_path() -> Path:
-    """~/.coffiebot data directory."""
-    return ensure_dir(Path.home() / ".coffiebot")
+    """
+    coffiebot 数据根目录。
+
+    优先读取环境变量 COFFIEBOT_DATA_DIR，未设置时回退到 ~/.coffiebot。
+    Docker 部署通过 volume 映射，本地部署可通过环境变量指向集中目录。
+    """
+    env = os.environ.get("COFFIEBOT_DATA_DIR")
+    base = Path(env) if env else Path.home() / ".coffiebot"
+    return ensure_dir(base)
 
 
 def get_workspace_path(workspace: str | None = None) -> Path:
-    """Resolve and ensure workspace path. Defaults to ~/.coffiebot/workspace."""
-    path = Path(workspace).expanduser() if workspace else Path.home() / ".coffiebot" / "workspace"
+    """Resolve and ensure workspace path. Defaults to <data_dir>/workspace."""
+    path = Path(workspace).expanduser() if workspace else get_data_path() / "workspace"
     return ensure_dir(path)
 
 
