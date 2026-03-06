@@ -226,6 +226,8 @@ class AgentDefaults(Base):
     temperature: float = 0.1
     max_tool_iterations: int = 40
     memory_window: int = 100
+    session_max_file_size_mb: int = 500  # 超过此阈值触发已 consolidated 消息清理（MB）
+    session_cleanup_size_mb: int = 100   # 每次清理目标释放大小（MB）
 
 
 class AgentsConfig(Base):
@@ -332,6 +334,16 @@ class OpenVikingConfig(Base):
     timeout: float = 15.0  # HTTP 请求超时（秒）
 
 
+class Mem0Config(Base):
+    """Mem0 记忆服务配置。"""
+
+    enabled: bool = False
+    server_url: str = ""        # mem0 服务地址，如 http://localhost:9356
+    user_id: str = "coffiebot"  # mem0 的 user_id 标识
+    agent_id: str = ""          # mem0 可选的 agent_id
+    timeout: float = 15.0       # HTTP 请求超时（秒）
+
+
 class Config(BaseSettings):
     """Root configuration for coffiebot."""
 
@@ -341,6 +353,7 @@ class Config(BaseSettings):
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     openviking: OpenVikingConfig = Field(default_factory=OpenVikingConfig)
+    mem0: Mem0Config = Field(default_factory=Mem0Config)
 
     @property
     def workspace_path(self) -> Path:

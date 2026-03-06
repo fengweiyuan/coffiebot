@@ -89,7 +89,8 @@ def _init_prompt_session() -> None:
     except Exception:
         pass
 
-    history_file = Path.home() / ".coffiebot" / "history" / "cli_history"
+    from coffiebot.utils.helpers import get_data_path
+    history_file = get_data_path() / "history" / "cli_history"
     history_file.parent.mkdir(parents=True, exist_ok=True)
 
     _PROMPT_SESSION = PromptSession(
@@ -191,7 +192,8 @@ def onboard():
     
     console.print(f"\n{__logo__} coffiebot is ready!")
     console.print("\nNext steps:")
-    console.print("  1. Add your API key to [cyan]~/.coffiebot/config.json[/cyan]")
+    from coffiebot.config.loader import get_config_path
+    console.print(f"  1. Add your API key to [cyan]{get_config_path()}[/cyan]")
     console.print("     Get one at: https://openrouter.ai/keys")
     console.print("  2. Chat: [cyan]coffiebot agent -m \"Hello!\"[/cyan]")
     console.print("\n[dim]Want Telegram/WhatsApp? See: https://github.com/HKUDS/coffiebot#-chat-apps[/dim]")
@@ -226,7 +228,8 @@ def _make_provider(config: Config):
     spec = find_by_name(provider_name)
     if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and spec.is_oauth):
         console.print("[red]Error: No API key configured.[/red]")
-        console.print("Set one in ~/.coffiebot/config.json under providers section")
+        from coffiebot.config.loader import get_config_path
+        console.print(f"Set one in {get_config_path()} under providers section")
         raise typer.Exit(1)
 
     return LiteLLMProvider(
@@ -280,7 +283,7 @@ def gateway(
     from loguru import logger
 
     # 获取日志目录
-    logs_dir = Path.home() / ".coffiebot" / "logs"
+    logs_dir = get_data_dir() / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     # 配置日志文件输出（rotation: 每天轮转，保留 7 天）
@@ -337,6 +340,9 @@ def gateway(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         openviking_config=config.openviking,
+        mem0_config=config.mem0,
+        session_max_file_size_mb=config.agents.defaults.session_max_file_size_mb,
+        session_cleanup_size_mb=config.agents.defaults.session_cleanup_size_mb,
     )
 
     # ========================================================================
@@ -606,8 +612,11 @@ def agent(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         openviking_config=config.openviking,
+        mem0_config=config.mem0,
+        session_max_file_size_mb=config.agents.defaults.session_max_file_size_mb,
+        session_cleanup_size_mb=config.agents.defaults.session_cleanup_size_mb,
     )
-    
+
     # Show spinner when logs are off (no output to miss); skip when logs are on
     def _thinking_ctx():
         if logs:
@@ -839,7 +848,8 @@ def _get_bridge_dir() -> Path:
     import subprocess
     
     # User's bridge location
-    user_bridge = Path.home() / ".coffiebot" / "bridge"
+    from coffiebot.config.loader import get_data_dir
+    user_bridge = get_data_dir() / "bridge"
     
     # Check if already built
     if (user_bridge / "dist" / "index.js").exists():
@@ -1098,6 +1108,9 @@ def cron_run(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         openviking_config=config.openviking,
+        mem0_config=config.mem0,
+        session_max_file_size_mb=config.agents.defaults.session_max_file_size_mb,
+        session_cleanup_size_mb=config.agents.defaults.session_cleanup_size_mb,
     )
 
     store_path = get_data_dir() / "cron" / "jobs.json"

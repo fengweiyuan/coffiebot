@@ -27,9 +27,8 @@ from coffiebot.providers.base import LLMProvider
 from coffiebot.session.manager import Session, SessionManager
 
 if TYPE_CHECKING:
-    from coffiebot.config.schema import ChannelsConfig, ExecToolConfig, OpenVikingConfig
+    from coffiebot.config.schema import ChannelsConfig, ExecToolConfig, Mem0Config, OpenVikingConfig
     from coffiebot.cron.service import CronService
-    from coffiebot.openviking.memory_bridge import MemoryBridge
 
 
 class AgentLoop:
@@ -80,6 +79,9 @@ class AgentLoop:
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
         openviking_config: OpenVikingConfig | None = None,
+        mem0_config: Mem0Config | None = None,
+        session_max_file_size_mb: int = 500,
+        session_cleanup_size_mb: int = 100,
     ):
         from coffiebot.config.schema import ExecToolConfig
         self.bus = bus
@@ -96,9 +98,14 @@ class AgentLoop:
         self.cron_service = cron_service
         self.restrict_to_workspace = restrict_to_workspace
         self._openviking_config = openviking_config
+        self._mem0_config = mem0_config
 
         self.context = ContextBuilder(workspace)
-        self.sessions = session_manager or SessionManager(workspace)
+        self.sessions = session_manager or SessionManager(
+            workspace,
+            max_file_size_mb=session_max_file_size_mb,
+            cleanup_size_mb=session_cleanup_size_mb,
+        )
         self.tools = ToolRegistry()
         self.subagents = SubagentManager(
             provider=provider,
@@ -117,7 +124,7 @@ class AgentLoop:
         self._mcp_stack: AsyncExitStack | None = None
         self._mcp_connected = False
         self._mcp_connecting = False
-        self._ov_bridge: MemoryBridge | None = None
+        self._memory_bridge: Any = None  # MemoryBridgeProtocol 实例
         self._consolidating: set[str] = set()  # Session keys with consolidation in progress
         self._consolidation_tasks: set[asyncio.Task] = set()  # Strong refs to in-flight tasks
         self._consolidation_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
@@ -165,6 +172,21 @@ class AgentLoop:
         finally:
             self._mcp_connecting = False
 
+    async def _connect_memory(self) -> None:
+        """
+        连接记忆后端（openviking 或 mem0，互斥）。
+
+        两者不能同时启用，启动时检测冲突直接报错。
+        """
+        ov_enabled = self._openviking_config and self._openviking_config.enabled
+        m0_enabled = self._mem0_config and self._mem0_config.enabled
+        if ov_enabled and m0_enabled:
+            raise RuntimeError("openviking 和 mem0 不能同时启用，请在配置中只启用其中一个")
+        if ov_enabled:
+            await self._connect_openviking()
+        elif m0_enabled:
+            await self._connect_mem0()
+
     async def _connect_openviking(self) -> None:
         """初始化 OpenViking 记忆桥接（一次性，启动时调用）。"""
         if not self._openviking_config or not self._openviking_config.enabled:
@@ -189,13 +211,35 @@ class AgentLoop:
             recall_limit=self._openviking_config.recall_limit,
             recall_score_threshold=self._openviking_config.recall_score_threshold,
         )
-        # 健康检查
         if await bridge.check_available():
-            self._ov_bridge = bridge
-            # 将 bridge 注入 ContextBuilder 的 MemoryStore
-            self.context.memory.set_openviking_bridge(bridge)
+            self._memory_bridge = bridge
+            self.context.memory.set_bridge(bridge)
         else:
             logger.warning("OpenViking health check failed, running without OV memory")
+
+    async def _connect_mem0(self) -> None:
+        """初始化 mem0 记忆桥接（一次性，启动时调用）。"""
+        if not self._mem0_config or not self._mem0_config.enabled:
+            return
+        if not self._mem0_config.server_url:
+            logger.warning("Mem0 enabled but server_url is empty, skipping")
+            return
+
+        from coffiebot.mem0.client import Mem0Client
+        from coffiebot.mem0.memory_bridge import Mem0Bridge
+
+        client = Mem0Client(
+            server_url=self._mem0_config.server_url,
+            user_id=self._mem0_config.user_id,
+            agent_id=self._mem0_config.agent_id,
+            timeout=self._mem0_config.timeout,
+        )
+        bridge = Mem0Bridge(client=client)
+        if await bridge.check_available():
+            self._memory_bridge = bridge
+            self.context.memory.set_bridge(bridge)
+        else:
+            logger.warning("Mem0 health check failed, running without Mem0 memory")
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
@@ -432,7 +476,7 @@ class AgentLoop:
         """
         self._running = True
         await self._connect_mcp()
-        await self._connect_openviking()
+        await self._connect_memory()
         self.context.skills.start_background_refresh()
         logger.info("Agent loop started")
 
@@ -500,9 +544,9 @@ class AgentLoop:
         """Stop the agent loop."""
         self._running = False
         self.context.skills.stop_background_refresh()
-        # 异步关闭 OV bridge 需要在事件循环中执行
-        if self._ov_bridge:
-            asyncio.ensure_future(self._ov_bridge.close())
+        # 异步关闭 memory bridge 需要在事件循环中执行
+        if self._memory_bridge:
+            asyncio.ensure_future(self._memory_bridge.close())
         logger.info("Agent loop stopping")
 
     async def _process_message(
@@ -582,7 +626,10 @@ class AgentLoop:
             async def _consolidate_and_unlock():
                 try:
                     async with lock:
-                        await self._consolidate_memory(session)
+                        if await self._consolidate_memory(session):
+                            # consolidation 成功后立即持久化 last_consolidated，
+                            # 防止进程 crash 后丢失指针更新
+                            self.sessions.save(session)
                 finally:
                     self._consolidating.discard(session.key)
                     _task = asyncio.current_task()
@@ -650,7 +697,7 @@ class AgentLoop:
         Params:
             session (Session): 当前会话
         """
-        if not self._ov_bridge or not self._ov_bridge.is_available:
+        if not self._memory_bridge or not self._memory_bridge.is_available:
             return
         # 提取最近一轮的 user/assistant 消息（从最后一条往前找到最近的 user 消息）
         turn_messages = []
@@ -664,7 +711,7 @@ class AgentLoop:
         if turn_messages:
             turn_messages.reverse()
             asyncio.ensure_future(
-                self._ov_bridge.capture(session.key, turn_messages)
+                self._memory_bridge.capture(session.key, turn_messages)
             )
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
@@ -716,7 +763,7 @@ class AgentLoop:
     ) -> str:
         """Process a message directly (for CLI or cron usage)."""
         await self._connect_mcp()
-        await self._connect_openviking()
+        await self._connect_memory()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
         response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
         return response.content if response else ""

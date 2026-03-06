@@ -76,11 +76,14 @@ class SessionManager:
     Sessions are stored as JSONL files in the sessions directory.
     """
 
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, max_file_size_mb: int = 500, cleanup_size_mb: int = 100):
         self.workspace = workspace
         self.sessions_dir = ensure_dir(self.workspace / "sessions")
-        self.legacy_sessions_dir = Path.home() / ".coffiebot" / "sessions"
+        from coffiebot.utils.helpers import get_data_path
+        self.legacy_sessions_dir = get_data_path() / "sessions"
         self._cache: dict[str, Session] = {}
+        self._max_file_size_bytes = max_file_size_mb * 1024 * 1024  # 触发清理的文件大小阈值
+        self._cleanup_size_bytes = cleanup_size_mb * 1024 * 1024    # 每次清理目标释放字节数
     
     def _get_session_path(self, key: str) -> Path:
         """Get the file path for a session."""
@@ -159,10 +162,9 @@ class SessionManager:
             logger.warning("Failed to load session {}: {}", key, e)
             return None
     
-    def save(self, session: Session) -> None:
-        """Save a session to disk."""
+    def _write_to_disk(self, session: Session) -> Path:
+        """将 session 序列化写入 JSONL 文件，返回文件路径。"""
         path = self._get_session_path(session.key)
-
         with open(path, "w", encoding="utf-8") as f:
             metadata_line = {
                 "_type": "metadata",
@@ -175,8 +177,56 @@ class SessionManager:
             f.write(json.dumps(metadata_line, ensure_ascii=False) + "\n")
             for msg in session.messages:
                 f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+        return path
 
+    def save(self, session: Session) -> None:
+        """Save a session to disk, trimming old consolidated messages if file is too large."""
+        path = self._write_to_disk(session)
         self._cache[session.key] = session
+
+        # 文件超阈值时裁剪已 consolidated 的旧消息
+        if self._max_file_size_bytes > 0:
+            try:
+                if path.stat().st_size > self._max_file_size_bytes:
+                    self._trim_consolidated(session)
+            except OSError:
+                pass
+
+    def _trim_consolidated(self, session: Session) -> None:
+        """
+        裁剪已 consolidated 的旧消息以缩减文件大小。
+
+        仅删除 messages[0:last_consolidated] 范围内的消息（已提交 mem0，LLM 不再需要）。
+        累计序列化字节达到 cleanup_size_bytes 后停止裁剪，然后重写文件。
+        """
+        if session.last_consolidated <= 0:
+            logger.warning(
+                "Session {} file exceeds size limit but last_consolidated=0, cannot trim",
+                session.key,
+            )
+            return
+
+        # 逐条累计已 consolidated 消息的序列化大小，直到达到清理目标
+        cumulative = 0
+        trim_count = 0
+        for i in range(session.last_consolidated):
+            line_bytes = len(json.dumps(session.messages[i], ensure_ascii=False).encode("utf-8")) + 1  # +1 for newline
+            cumulative += line_bytes
+            trim_count = i + 1
+            if cumulative >= self._cleanup_size_bytes:
+                break
+
+        if trim_count <= 0:
+            return
+
+        logger.info(
+            "Trimming {} consolidated messages (~{:.1f}MB) from session {}",
+            trim_count, cumulative / (1024 * 1024), session.key,
+        )
+
+        session.messages = session.messages[trim_count:]
+        session.last_consolidated = max(0, session.last_consolidated - trim_count)
+        self._write_to_disk(session)
     
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
